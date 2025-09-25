@@ -1,0 +1,565 @@
+""" SearchCot completo (single-file) — versão "humano" com interface tipo navegador License: Apache 2.0
+
+Alterações principais sobre a versão fornecida:
+
+Adicionado modo 'human' (serve --human) que oferece uma barra de URL e possibilidade de "navegar" páginas web pelo servidor
+
+Endpoint /visit?url=... que busca a página, sanitiza (remove scripts/iframes/styles) e reescreve links para passar pelo proxy do app -> comportamento semelhante a um "browser" simples
+
+Pequenas melhorias na interface (formulário de busca + barra de URL) e instruções de uso
+
+Aviso de segurança embutido (SSRF/XSS): execute localmente apenas.
+
+
+Dependências (instale): pip install aiohttp beautifulsoup4 flask tqdm numpy scikit-learn markupsafe
+
+opcional para embeddings semânticos:
+
+pip install sentence-transformers faiss-cpu
+
+Uso:
+
+Crawl e indexar
+
+python buscador_ai_humano.py crawl https://example.com --max-pages 200
+
+Buscar no CLI
+
+python buscador_ai_humano.py search "termo de busca"
+
+Subir interface web local simples
+
+python buscador_ai_humano.py serve --host 127.0.0.1 --port 8080
+
+Subir interface com modo "humano" (barra de URL / visit proxy)
+
+python buscador_ai_humano.py serve --human
+
+Avisos importantes:
+
+O endpoint /visit fetch/serve páginas remotas pelo servidor (proxy). Isso pode expor seu servidor a riscos (SSRF, conteúdo malicioso). Execute localmente e com cuidado.
+
+Esta é uma base: personalize o HTML e políticas de segurança conforme seu caso de uso. """
+
+
+import argparse import asyncio import aiohttp import re import sqlite3 import time import os import math from urllib.parse import urljoin, urldefrag, urlparse, quote_plus from bs4 import BeautifulSoup from collections import defaultdict, Counter from tqdm import tqdm import json
+
+Optional imports
+
+try: import numpy as np from sklearn.neighbors import NearestNeighbors has_numpy = True except Exception: has_numpy = False
+
+try: from sentence_transformers import SentenceTransformer has_st = True except Exception: has_st = False
+
+-------------------------------
+
+Config
+
+-------------------------------
+
+DB_PATH = ":memory:" USER_AGENT = "MiniBot/1.0 (+https://example.com)" CRAWL_CONCURRENCY = 10 CRAWL_TIMEOUT = 15 MIN_TEXT_LENGTH = 200 DEFAULT_TOP_K = 10
+
+Small stopword list (can be replaced by NLTK or Snowball)
+
+STOPWORDS = set([ "o","a","os","as","um","uma","uns","umas","de","do","da","dos","das", "e","é","em","no","na","nos","nas","por","com","para","que","como","se", "por","ao","à","às","mais","não","um","uma","sou","sou","me","mi","ele","ela" ])
+
+-------------------------------
+
+Utilities: tokenization
+
+-------------------------------
+
+TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+def tokenize(text): tokens = [t.lower() for t in TOKEN_RE.findall(text)] tokens = [t for t in tokens if t not in STOPWORDS and len(t) > 1 and not t.isdigit()] return tokens
+
+-------------------------------
+
+Storage (SQLite-based index)
+
+-------------------------------
+
+class IndexDB: def init(self, path=DB_PATH): self.path = path init_needed = not os.path.exists(path) self.conn = sqlite3.connect(path, check_same_thread=False) self.conn.execute("PRAGMA journal_mode=WAL") if init_needed: self._init_db()
+
+def _init_db(self):
+    cur = self.conn.cursor()
+    cur.executescript("""
+    CREATE TABLE docs (
+        id INTEGER PRIMARY KEY,
+        url TEXT UNIQUE,
+        title TEXT,
+        content TEXT,
+        length INTEGER,
+        crawled_at REAL
+    );
+    CREATE TABLE terms (
+        term TEXT PRIMARY KEY,
+        doc_freq INTEGER
+    );
+    CREATE TABLE postings (
+        term TEXT,
+        doc_id INTEGER,
+        freq INTEGER,
+        PRIMARY KEY(term, doc_id)
+    );
+    CREATE INDEX idx_postings_term ON postings(term);
+    CREATE INDEX idx_postings_doc ON postings(doc_id);
+    CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
+    """)
+    self.conn.commit()
+
+def add_doc(self, url, title, content):
+    tokens = tokenize(content)
+    length = len(tokens)
+    cur = self.conn.cursor()
+    try:
+        cur.execute("INSERT INTO docs (url,title,content,length,crawled_at) VALUES (?,?,?,?,?)",
+                    (url, title, content, length, time.time()))
+        doc_id = cur.lastrowid
+    except sqlite3.IntegrityError:
+        # already exists — update
+        cur.execute("SELECT id FROM docs WHERE url = ?", (url,))
+        doc_id = cur.fetchone()[0]
+        cur.execute("UPDATE docs SET title=?, content=?, length=?, crawled_at=? WHERE id=?",
+                    (title, content, length, time.time(), doc_id))
+        cur.execute("DELETE FROM postings WHERE doc_id=?", (doc_id,))
+
+    freqs = Counter(tokens)
+    for t, f in freqs.items():
+        cur.execute("INSERT OR IGNORE INTO terms(term, doc_freq) VALUES (?,0)", (t,))
+        # increment doc_freq only once per doc
+        cur.execute("SELECT 1 FROM postings WHERE term=? AND doc_id=?", (t, doc_id))
+        if not cur.fetchone():
+            cur.execute("UPDATE terms SET doc_freq = doc_freq + 1 WHERE term= ?", (t,))
+        cur.execute("INSERT OR REPLACE INTO postings(term, doc_id, freq) VALUES (?,?,?)", (t, doc_id, f))
+
+    self.conn.commit()
+    return doc_id
+
+def get_doc(self, doc_id):
+    cur = self.conn.cursor()
+    cur.execute("SELECT id,url,title,content,length,crawled_at FROM docs WHERE id=?", (doc_id,))
+    row = cur.fetchone()
+    if not row: return None
+    keys = ["id","url","title","content","length","crawled_at"]
+    return dict(zip(keys, row))
+
+def search_terms_postings(self, terms):
+    # return dict term -> list of (doc_id, freq)
+    cur = self.conn.cursor()
+    out = {}
+    for t in terms:
+        cur.execute("SELECT doc_id, freq FROM postings WHERE term=?", (t,))
+        out[t] = cur.fetchall()
+    return out
+
+def total_docs(self):
+    cur = self.conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM docs")
+    return cur.fetchone()[0]
+
+def get_term_doc_freq(self, term):
+    cur = self.conn.cursor()
+    cur.execute("SELECT doc_freq FROM terms WHERE term=?", (term,))
+    r = cur.fetchone()
+    return r[0] if r else 0
+
+def all_docs_meta(self):
+    cur = self.conn.cursor()
+    cur.execute("SELECT id,url,title,length FROM docs")
+    return cur.fetchall()
+
+def close(self):
+    self.conn.commit()
+    self.conn.close()
+
+-------------------------------
+
+Rankers: TF-IDF and BM25
+
+-------------------------------
+
+class Ranker: def init(self, index: IndexDB): self.index = index
+
+def tf_idf_scores(self, query_tokens):
+    N = max(1, self.index.total_docs())
+    postings = self.index.search_terms_postings(query_tokens)
+    scores = defaultdict(float)
+    doc_lengths = {}
+    for t in query_tokens:
+        posting = postings.get(t, [])
+        df = max(1, self.index.get_term_doc_freq(t))
+        idf = math.log((N+1) / df)
+        for doc_id, freq in posting:
+            scores[doc_id] += freq * idf
+            if doc_id not in doc_lengths:
+                doc = self.index.get_doc(doc_id)
+                doc_lengths[doc_id] = doc['length'] if doc else 0
+    # normalize by doc length
+    for d in list(scores.keys()):
+        L = max(1, doc_lengths.get(d,1))
+        scores[d] /= math.sqrt(L)
+    return scores
+
+def bm25_scores(self, query_tokens, k1=1.5, b=0.75):
+    N = max(1, self.index.total_docs())
+    postings = self.index.search_terms_postings(query_tokens)
+    scores = defaultdict(float)
+    # avgdl
+    docs = self.index.all_docs_meta()
+    avgdl = sum([r[3] for r in docs]) / max(1, len(docs))
+    for t in query_tokens:
+        posting = postings.get(t, [])
+        df = max(1, self.index.get_term_doc_freq(t))
+        idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
+        for doc_id, freq in posting:
+            doc = self.index.get_doc(doc_id)
+            dl = doc['length'] if doc else 0
+            denom = freq + k1 * (1 - b + b * (dl / avgdl))
+            score = idf * (freq * (k1 + 1)) / max(1e-9, denom)
+            scores[doc_id] += score
+    return scores
+
+-------------------------------
+
+Crawler
+
+-------------------------------
+
+class Crawler: def init(self, db: IndexDB, max_pages=200, max_depth=2, same_domain=True, concurrency=CRAWL_CONCURRENCY): self.db = db self.seen = set() self.to_visit = asyncio.Queue() self.session = None self.max_pages = max_pages self.max_depth = max_depth self.same_domain = same_domain self.concurrency = concurrency self.count = 0
+
+async def _fetch(self, url):
+    try:
+        async with self.session.get(url, timeout=CRAWL_TIMEOUT) as resp:
+            if resp.status != 200:
+                return None
+            text = await resp.text(errors='ignore')
+            return text
+    except Exception:
+        return None
+
+def _extract(self, base_url, html):
+    soup = BeautifulSoup(html, 'html.parser')
+    title = soup.title.string.strip() if soup.title and soup.title.string else ''
+    # try to extract main text heuristically
+    for script in soup(['script','style','noscript']):
+        script.decompose()
+    texts = soup.get_text(separator=' ')
+    text = re.sub(r'\s+', ' ', texts).strip()
+    links = []
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        href = urljoin(base_url, href)
+        href = urldefrag(href)[0]
+        links.append(href)
+    return title, text, links
+
+async def worker(self, origin_host):
+    while self.count < self.max_pages:
+        try:
+            url, depth = await asyncio.wait_for(self.to_visit.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            return
+        if url in self.seen:
+            self.to_visit.task_done()
+            continue
+        if self.same_domain and urlparse(url).hostname != origin_host:
+            self.to_visit.task_done()
+            continue
+        self.seen.add(url)
+        html = await self._fetch(url)
+        if not html:
+            self.to_visit.task_done()
+            continue
+        title, text, links = self._extract(url, html)
+        if len(text) >= MIN_TEXT_LENGTH:
+            self.db.add_doc(url, title, text)
+            self.count += 1
+        # enqueue links
+        if depth < self.max_depth:
+            for l in links:
+                if l not in self.seen:
+                    await self.to_visit.put((l, depth+1))
+        self.to_visit.task_done()
+
+async def crawl(self, seeds):
+    connector = aiohttp.TCPConnector(limit=self.concurrency)
+    headers = {"User-Agent": USER_AGENT}
+    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+        self.session = session
+        # enqueue seeds
+        origin_host = urlparse(seeds[0]).hostname if seeds else None
+        for s in seeds:
+            await self.to_visit.put((s, 0))
+        workers = [asyncio.create_task(self.worker(origin_host)) for _ in range(self.concurrency)]
+        await self.to_visit.join()
+        for w in workers:
+            w.cancel()
+
+-------------------------------
+
+Semantic component (optional)
+
+-------------------------------
+
+class SemanticIndex: def init(self, db: IndexDB, model_name='all-MiniLM-L6-v2'): if not has_st or not has_numpy: raise RuntimeError('sentence-transformers or numpy not available') self.db = db self.model = SentenceTransformer(model_name) self.embeddings = None self.doc_ids = None self.nn = None
+
+def build(self):
+    rows = self.db.all_docs_meta()
+    texts = []
+    ids = []
+    for doc_id, url, title, length in rows:
+        d = self.db.get_doc(doc_id)
+        if not d: continue
+        texts.append((d['title'] or '') + '\n' + (d['content'] or ''))
+        ids.append(doc_id)
+    if not texts:
+        self.embeddings = np.zeros((0,1))
+        self.doc_ids = []
+        return
+    embs = self.model.encode(texts, show_progress_bar=True)
+    self.embeddings = np.array(embs, dtype=np.float32)
+    self.doc_ids = ids
+    # build exact neighbor search (can be swapped for faiss or annoy)
+    self.nn = NearestNeighbors(n_neighbors=10, metric='cosine')
+    self.nn.fit(self.embeddings)
+
+def query(self, q, k=10):
+    if self.nn is None:
+        self.build()
+    q_emb = np.array(self.model.encode([q]), dtype=np.float32)
+    dists, idxs = self.nn.kneighbors(q_emb, n_neighbors=k)
+    results = []
+    for dist, idx in zip(dists[0], idxs[0]):
+        doc_id = self.doc_ids[idx]
+        results.append((doc_id, 1 - float(dist)))
+    return results
+
+-------------------------------
+
+Snippets
+
+-------------------------------
+
+def make_snippet(content, query_terms, maxlen=320): # find first occurrence text = content lowered = text.lower() pos = None for t in query_terms: p = lowered.find(t) if p >= 0: pos = p break if pos is None: excerpt = text[:maxlen] else: start = max(0, pos-80) excerpt = text[start:start+maxlen] excerpt = excerpt.replace('\n',' ')[:maxlen] return '...'+excerpt+'...'
+
+-------------------------------
+
+High-level search API (CLI-friendly)
+
+-------------------------------
+
+class SearchEngine: def init(self, db_path=DB_PATH): self.db = IndexDB(db_path) self.ranker = Ranker(self.db) self.semantic = None
+
+def ensure_semantic(self):
+    if not has_st or not has_numpy:
+        print('Semantic search not available. Install sentence-transformers and numpy.')
+        return False
+    if not self.semantic:
+        self.semantic = SemanticIndex(self.db)
+        self.semantic.build()
+    return True
+
+def search(self, q, k=DEFAULT_TOP_K, use_semantic=False):
+    q_tokens = tokenize(q)
+    tfidf = self.ranker.tf_idf_scores(q_tokens)
+    bm25 = self.ranker.bm25_scores(q_tokens)
+    # combine scores
+    combined = defaultdict(float)
+    for doc_id, s in tfidf.items():
+        combined[doc_id] += 0.4 * s
+    for doc_id, s in bm25.items():
+        combined[doc_id] += 0.6 * s
+    # semantic rerank
+    sem_results = []
+    if use_semantic and self.ensure_semantic():
+        sem_results = self.semantic.query(q, k=50)
+        sem_dict = {doc:score for doc,score in sem_results}
+        # boost combined score
+        for d, boost in sem_dict.items():
+            combined[d] += 2.0 * boost
+    # sort
+    ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)
+    top = ranked[:k]
+    results = []
+    for doc_id, score in top:
+        doc = self.db.get_doc(doc_id)
+        snippet = make_snippet(doc['content'] if doc else '', q_tokens)
+        results.append({
+            'id': doc_id,
+            'url': doc['url'] if doc else '',
+            'title': doc['title'] if doc else '',
+            'score': float(score),
+            'snippet': snippet
+        })
+    return results
+
+-------------------------------
+
+Simple Flask app (local only) + modo humano
+
+-------------------------------
+
+from markupsafe import Markup
+
+def create_flask_app(engine: SearchEngine, human_mode=False): try: from flask import Flask, request, render_template_string except Exception: raise RuntimeError('Flask not installed') app = Flask(name)
+
+TEMPLATE = """
+<!doctype html>
+<title>Resultados encontrados pelo buscador</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; margin: 20px; }
+  .top { display:flex; gap:12px; align-items:center }
+  .result { margin-bottom: 18px; padding-bottom: 10px; border-bottom: 1px solid #eee }
+  .title { font-size: 18px; font-weight: bold }
+  .url { color: #006; font-size: 12px }
+  .snippet { margin-top: 6px }
+  .urlbar { width: 600px }
+</style>
+<h1>Resultados encontrados pelo buscador</h1>
+<div class="top">
+  <form method="get" style="display:inline-block;">
+    <input name="q" size="40" value="{{q|e}}" autofocus>
+    <label><input type="checkbox" name="sem" {% if sem %}checked{% endif %}> Semantic</label>
+    <button>Pesquisar</button>
+  </form>
+  {% if human_mode %}
+  <form method="get" action="/visit" style="display:inline-block; margin-left:12px;">
+    <input name="url" class="urlbar" placeholder="https://... ou clique em um resultado" value="{{visit_url|e}}">
+    <button>Abrir</button>
+  </form>
+  {% endif %}
+</div>
+{% if warning %}
+  <p style="color:darkred">{{ warning }}</p>
+{% endif %}
+{% if results is not none %}
+  <p>Resultados: {{ results|length }}</p>
+  {% for r in results %}
+    <div class="result">
+      <div class="title"><a href="/visit?url={{ r.url|urlencode }}">{{ r.title }}</a></div>
+      <div class="url">{{ r.url }}</div>
+      <div class="snippet">{{ r.snippet }}</div>
+    </div>
+  {% endfor %}
+{% endif %}
+{% if page_content is not none %}
+  <hr>
+  <h2>Conteúdo: {{ page_title }}</h2>
+  <div>{{ page_content }}</div>
+{% endif %}
+"""
+
+@app.template_filter('urlencode')
+def urlencode_filter(s):
+    return quote_plus(s)
+
+@app.route('/')
+def home():
+    q = request.args.get('q','')
+    sem = request.args.get('sem') is not None
+    results = None
+    visit_url = ''
+    warning = None
+    if q:
+        results = engine.search(q, k=50, use_semantic=sem)
+    if human_mode:
+        warning = 'Modo humano ativo: o servidor fará fetch das páginas que você abrir. Rode localmente e com cuidado.'
+    return render_template_string(TEMPLATE, q=q, results=results, sem=sem, human_mode=human_mode, visit_url=visit_url, warning=warning, page_content=None, page_title='')
+
+async def _fetch_remote(url):
+    headers = {'User-Agent': USER_AGENT}
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, timeout=10) as resp:
+                text = await resp.text(errors='ignore')
+                return text, resp.headers.get('content-type','')
+    except Exception as e:
+        return f"__ERROR__:{e}", 'text/plain'
+
+@app.route('/visit')
+def visit():
+    url = request.args.get('url')
+    if not url:
+        return "No url provided", 400
+    # sanitize URL basic check
+    parsed = urlparse(url)
+    if parsed.scheme not in ('http','https'):
+        return "Unsupported URL scheme", 400
+    # fetch asynchronously inside sync route
+    html, ctype = asyncio.run(_fetch_remote(url))
+    if isinstance(html, str) and html.startswith('__ERROR__'):
+        return f"Erro ao buscar: {html}", 500
+    # parse and sanitize
+    soup = BeautifulSoup(html, 'html.parser')
+    for tag in soup(['script','iframe','style']):
+        tag.decompose()
+    # rewrite links to route through /visit so navigation stays in app
+    for a in soup.find_all('a', href=True):
+        try:
+            new = urljoin(url, a['href'])
+            a['href'] = '/visit?url=' + quote_plus(new)
+            a['target'] = '_self'
+        except Exception:
+            pass
+    # basic page title
+    title = soup.title.string if soup.title and soup.title.string else url
+    content = Markup(str(soup))
+    # show search box + content
+    q = request.args.get('q','')
+    sem = request.args.get('sem') is not None
+    results = None
+    warning = 'Modo humano ativo: fetch remoto via servidor. Cuidado com conteúdos maliciosos.' if human_mode else None
+    return render_template_string(TEMPLATE, q=q, results=results, sem=sem, human_mode=human_mode, visit_url=url, warning=warning, page_content=content, page_title=title)
+
+return app
+
+-------------------------------
+
+CLI
+
+-------------------------------
+
+def main(): parser = argparse.ArgumentParser(description='SearchCot completo (local) - versão humano') sub = parser.add_subparsers(dest='cmd')
+
+p_crawl = sub.add_parser('crawl')
+p_crawl.add_argument('seeds', nargs='+')
+p_crawl.add_argument('--max-pages', type=int, default=200)
+p_crawl.add_argument('--max-depth', type=int, default=2)
+p_crawl.add_argument('--same-domain', action='store_true')
+
+p_search = sub.add_parser('search')
+p_search.add_argument('query', nargs='+')
+p_search.add_argument('--k', type=int, default=10)
+p_search.add_argument('--semantic', action='store_true')
+
+p_serve = sub.add_parser('serve')
+p_serve.add_argument('--host', default='127.0.0.1')
+p_serve.add_argument('--port', default=8080, type=int)
+p_serve.add_argument('--human', action='store_true', help='Ativa barra de URL / modo "navegador" (fetch server-side)')
+
+args = parser.parse_args()
+if args.cmd == 'crawl':
+    db = IndexDB()
+    c = Crawler(db, max_pages=args.max_pages, max_depth=args.max_depth, same_domain=args.same_domain)
+    asyncio.run(c.crawl(args.seeds))
+    print('Crawl finished. Docs:', db.total_docs())
+    db.close()
+elif args.cmd == 'search':
+    q = ' '.join(args.query)
+    engine = SearchEngine()
+    res = engine.search(q, k=args.k, use_semantic=args.semantic)
+    for i, r in enumerate(res, start=1):
+        print(f"{i}. {r['title']} ({r['url']}) score={r['score']:.4f}")
+        print(r['snippet'])
+        print('-'*60)
+elif args.cmd == 'serve':
+    engine = SearchEngine()
+    app = create_flask_app(engine, human_mode=args.human)
+    print(f"Abrindo servidor em http://{args.host}:{args.port} (human_mode={args.human})")
+    # Warning: for local testing only. Don't expose to internet without proper hardening.
+    app.run(host=args.host, port=args.port)
+else:
+    parser.print_help()
+
+if name == 'main': main()
+
